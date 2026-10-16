@@ -49,7 +49,7 @@ enum Action {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    let Some(bank) = cli.bank.or_else(|| std::env::home_dir().map(|home| home.join(".membank/global"))) else {
+    let Some(bank) = cli.bank.or_else(default_bank) else {
         eprintln!("membank: no home directory; pass --bank or set MEMBANK");
         process::exit(1);
     };
@@ -85,7 +85,10 @@ fn run(dir: &Path, action: Action) -> io::Result<()> {
         Action::Context { budget } => {
             let bank = open()?;
             let mut out = io::stdout().lock();
-            let m = format!("{} --bank {}", std::env::current_exe()?.display(), dir.display());
+            let mut m = std::env::current_exe()?.display().to_string();
+            if default_bank().as_deref() != Some(dir) {
+                m = format!("{m} --bank {}", dir.display());
+            }
             writeln!(out, "<membank>
 The <chat> below is the user's entire history with you, every chat in every
 project. What they told you before is here, not in the code or memory files.
@@ -150,6 +153,10 @@ in your reply what you learned that will matter later.
         }
     }
     Ok(())
+}
+
+fn default_bank() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".membank/global"))
 }
 
 fn lock(dir: &Path) -> io::Result<File> {
