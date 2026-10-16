@@ -85,7 +85,7 @@ fn run(dir: &Path, action: Action) -> io::Result<()> {
         Action::Context { budget } => {
             let bank = open()?;
             let mut out = io::stdout().lock();
-            let m = format!("membank --bank {}", dir.display());
+            let m = format!("{} --bank {}", std::env::current_exe()?.display(), dir.display());
             writeln!(out, "<membank>
 The <chat> below is the user's entire history with you, every chat in every
 project. What they told you before is here, not in the code or memory files.
