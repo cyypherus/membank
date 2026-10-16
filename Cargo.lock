@@ -1888,10 +1888,45 @@ dependencies = [
 name = "membank"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "membank-claude"
+version = "0.1.0"
+dependencies = [
+ "membank",
+ "membank-convert",
+ "serde_json",
+]
+
+[[package]]
+name = "membank-cli"
+version = "0.1.0"
+dependencies = [
  "clap",
  "env_logger",
  "log",
- "serde",
+ "membank",
+ "serde_json",
+]
+
+[[package]]
+name = "membank-codex"
+version = "0.1.0"
+dependencies = [
+ "membank",
+ "membank-convert",
+ "serde_json",
+]
+
+[[package]]
+name = "membank-convert"
+version = "0.1.0"
+dependencies = [
+ "membank",
  "serde_json",
 ]
 

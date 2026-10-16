@@ -1,14 +1,15 @@
 use haven::winit::WinitApp;
 use haven::*;
-use membank::{Bank, Kind, LIMIT, Node};
+use membank::{Bank, Dir, Kind, Limits, Message, Node};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process;
 
 struct State {
     dir: PathBuf,
-    bank: Bank,
+    bank: Bank<Dir>,
     lines: Vec<Node>,
     built: usize,
     path: Vec<Node>,
@@ -55,7 +56,7 @@ const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Au
 
 impl State {
     fn total(&self) -> u32 {
-        self.bank.messages.len() as u32
+        self.bank.messages().len() as u32
     }
 
     fn top(&self) -> u8 {
@@ -68,7 +69,7 @@ impl State {
 
     fn route(&self, node: Node) -> Vec<Node> {
         let mut path = vec![self.line_of(node.start())];
-        while let Some(&last) = path.last().filter(|n| n.0 > node.0) {
+        while let Some(&last) = path.last().filter(|n| n.level > node.level) {
             let [a, b] = last.children().expect("a line above level 0 has children");
             path.push(if node.start() < b.start() { a } else { b });
         }
@@ -78,7 +79,7 @@ impl State {
     fn class(&self, node: Node) -> Class {
         let line = self.line_of(node.start());
         match () {
-            _ if node.0 > line.0 => Class::Coarser,
+            _ if node.level > line.level => Class::Coarser,
             _ if self.bank.text(node).is_none() => Class::Unbuilt,
             _ if node == line => Class::Line,
             _ => Class::Reachable,
@@ -160,8 +161,8 @@ impl State {
                         }
                     }
                     _ => {
-                        if let Some(i) = if right { Some(last.1 + 1) } else { last.1.checked_sub(1) }.filter(|&i| i < self.total() >> last.0) {
-                            self.path = self.route(Node(last.0, i));
+                        if let Some(i) = if right { Some(last.index + 1) } else { last.index.checked_sub(1) }.filter(|&i| i < self.total() >> last.level) {
+                            self.path = self.route(Node { index: i, ..last });
                         }
                     }
                 }
@@ -173,11 +174,21 @@ impl State {
     }
 }
 
-fn load(bank: Bank) -> (Bank, Vec<Node>, usize) {
-    let covered = bank.view.last().map_or(0, |n| n.end());
-    let lines = bank.view.iter().copied().chain((covered..bank.messages.len() as u32).map(|i| Node(0, i))).collect();
+fn load(bank: Bank<Dir>) -> (Bank<Dir>, Vec<Node>, usize) {
+    let covered = bank.context().last().map_or(0, |n| n.end());
+    let lines = bank.context().iter().copied().chain((covered..bank.messages().len() as u32).map(Node::message)).collect();
     let built = bank.nodes().count();
     (bank, lines, built)
+}
+
+fn ends(bank: &Bank<Dir>, node: Node) -> (Option<&Message>, Option<&Message>) {
+    let mut messages = bank.messages()[node.start() as usize..node.end() as usize].iter().flatten();
+    let first = messages.next();
+    (first, messages.next_back().or(first))
+}
+
+fn when(message: Option<&Message>) -> String {
+    message.map_or_else(String::new, |m| moment(&m.date))
 }
 
 fn moment(date: &str) -> String {
@@ -221,7 +232,7 @@ fn fit(text: &str, columns: usize, lines: usize) -> String {
 }
 
 fn key(node: Node) -> u64 {
-    (node.0 as u64) << 32 | node.1 as u64
+    (node.level as u64) << 32 | node.index as u64
 }
 
 fn mono<'a>(id: u64, body: impl AsRef<str>, size: u32, color: Color, app: &mut PaneState) -> View<'a, State> {
@@ -316,7 +327,8 @@ fn chip<'a>(id: u64, label: &str, value: String, color: Color, border: Color, do
 
 fn header<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let total = state.total();
-    let bytes: usize = state.lines.iter().map(|&n| state.bank.line(n).len() + 1).sum();
+    let shown = state.bank.visible(&state.lines);
+    let bytes: usize = shown.iter().map(|&n| state.bank.line(n).len() + 1).sum();
     let complete: usize = (0..=state.top()).map(|l| (total >> l) as usize).sum();
     let pending = complete.saturating_sub(state.built);
     let (link, link_color) = if state.locked { ("LOCKED", RED) } else { ("TRACKING", CYAN) };
@@ -378,7 +390,7 @@ fn header<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
             hazard.expand_x().height(48.),
             chip(id!(), "LOG", format!("{total} MSG"), TEXT, LINE_HI, None, app),
             chip(id!(), "TREE", format!("L0–L{} · {} NODES", state.top(), state.built), TEXT, LINE_HI, None, app),
-            chip(id!(), "VIEW", format!("{} NODES · {:.1} KB", state.lines.len(), bytes as f32 / 1024.), TEXT, LINE_HI, None, app),
+            chip(id!(), "CONTEXT", format!("{} NODES · {:.1} KB", shown.len(), bytes as f32 / 1024.), TEXT, LINE_HI, None, app),
             match pending {
                 0 => chip(id!(), "COMPACTOR", "SYNCED".to_string(), CYAN, LINE_HI, Some(CYAN), app),
                 n => chip(id!(), "COMPACTOR", format!("{n} PENDING"), AMBER, LINE_HI, Some(CYAN), app),
@@ -419,7 +431,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
         };
         if count <= EXACT {
             for i in visible(l, count) {
-                let node = Node(l, i);
+                let node = Node { level: l, index: i };
                 push(node.start(), node.end(), state.class(node));
                 if width >= 3. {
                     seams.push((x(node.end()), y(l)));
@@ -429,7 +441,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
             for &line in &state.lines {
                 let end = line.end().min(count << l);
                 if line.start() < end && line.start() < hi.ceil() as u32 && lo < end as f32 {
-                    let class = match l.cmp(&line.0) {
+                    let class = match l.cmp(&line.level) {
                         std::cmp::Ordering::Greater => Class::Coarser,
                         std::cmp::Ordering::Equal => Class::Line,
                         std::cmp::Ordering::Less => Class::Reachable,
@@ -472,7 +484,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
         .iter()
         .filter_map(|(n, _)| {
             let (left, right) = span(n.start(), n.end());
-            (left < right).then(|| (left, (right - left).max(2.), y(n.0)))
+            (left < right).then(|| (left, (right - left).max(2.), y(n.level)))
         })
         .collect();
     views.push(
@@ -497,20 +509,20 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
     for (k, &node) in state.path.iter().enumerate() {
         lit.push((node, AMBER));
         if k > 0 {
-            lit.extend(state.path[k - 1].children().into_iter().flatten().filter(|&c| c != node).map(|c| (c, state.color(c.0).with_alpha(0.6))));
+            lit.extend(state.path[k - 1].children().into_iter().flatten().filter(|&c| c != node).map(|c| (c, state.color(c.level).with_alpha(0.6))));
         }
     }
-    lit.extend(last.children().into_iter().flatten().map(|c| (c, state.color(c.0).with_alpha(0.6))));
+    lit.extend(last.children().into_iter().flatten().map(|c| (c, state.color(c.level).with_alpha(0.6))));
     for (n, (node, color)) in lit.into_iter().enumerate() {
         let (left, right) = span(node.start(), node.end());
         if left < right {
-            views.push(placed(square(id!(key(node), n as u64)).fill(color).stroke(BG, Stroke::new(1.)).build(ctx), area, left, y(node.0) + 1., (right - left).max(1.), ROW - 2.));
+            views.push(placed(square(id!(key(node), n as u64)).fill(color).stroke(BG, Stroke::new(1.)).build(ctx), area, left, y(node.level) + 1., (right - left).max(1.), ROW - 2.));
         }
     }
     if let Some(tip) = state.tip {
         let (left, right) = span(tip.start(), tip.end());
         let ring = square(id!(key(tip))).fill(TRANSPARENT).stroke(TEXT, Stroke::new(1.5)).build(ctx);
-        views.push(placed(ring, area, left, y(tip.0) + 1., (right - left).max(2.), ROW - 2.));
+        views.push(placed(ring, area, left, y(tip.level) + 1., (right - left).max(2.), ROW - 2.));
     }
     for l in 0..=top {
         let count = state.total() >> l;
@@ -518,7 +530,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
         let cells = ((lo as u32 >> l) / group)..((hi.ceil() as u32 >> l).min(count) + group - 1) / group;
         for k in cells {
             let (first, last) = (k * group, ((k + 1) * group).min(count));
-            let node = Node(l, (first + last) / 2);
+            let node = Node { level: l, index: (first + last) / 2 };
             let (left, right) = (x(first << l).max(0.), x(last << l).min(area.width));
             let target = square(id!(key(node), k as u64))
                 .fill(TRANSPARENT)
@@ -554,13 +566,13 @@ fn schematic_panel<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State>
         Some(tip) => {
             let line = state.line_of(tip.start());
             let place = match state.class(tip) {
-                Class::Coarser => "coarser than view · agent sees its children".to_string(),
-                _ if tip == line => "view line".to_string(),
+                Class::Coarser => "coarser than context · agent sees its children".to_string(),
+                _ if tip == line => "context line".to_string(),
                 _ => format!("inside {line}"),
             };
-            format!("{tip} · L{} · {place} · {}", tip.0, clip(state.bank.text(tip).unwrap_or("not built yet"), 70))
+            format!("{tip} · L{} · {place} · {}", tip.level, clip(state.bank.text(tip).unwrap_or("not built yet"), 70))
         }
-        None if last.0 == 0 => format!("focus · message #{}", last.start()),
+        None if last.level == 0 => format!("focus · message #{}", last.start()),
         None => format!("focus · {last} · {} msgs", last.len()),
     };
     let legend = |id: u64, label: &str, swatch: View<'a, State>, app: &mut PaneState| {
@@ -570,7 +582,7 @@ fn schematic_panel<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State>
     let labels: Vec<View<'a, State>> = (0..=state.top())
         .rev()
         .map(|l| {
-            let hot = state.path.iter().any(|n| n.0 == l);
+            let hot = state.path.iter().any(|n| n.level == l);
             row(vec![space(), mono(id!(l as u64), format!("L{l}"), 10, if hot { AMBER } else { FAINT }, app)]).height(ROW)
         })
         .collect();
@@ -595,9 +607,9 @@ fn schematic_panel<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State>
                     vec![
                         display(id!(), "TREE SCHEMATIC", 16, TEXT, app),
                         jp(id!(), "系統図", 12, app),
-                        legend(1, "view line", square(id!()).fill(color.with_alpha(0.5)).stroke(color, Stroke::new(1.)).build(app), app),
+                        legend(1, "context line", square(id!()).fill(color.with_alpha(0.5)).stroke(color, Stroke::new(1.)).build(app), app),
                         legend(2, "reachable by zoom", square(id!()).fill(color.with_alpha(0.18)).build(app), app),
-                        legend(3, "coarser than view", square(id!()).fill(AMBER.with_alpha(0.06)).stroke(LINE_HI, Stroke::new(1.)).build(app), app),
+                        legend(3, "coarser than context", square(id!()).fill(AMBER.with_alpha(0.06)).stroke(LINE_HI, Stroke::new(1.)).build(app), app),
                         legend(4, "not built yet", square(id!()).fill(TRANSPARENT).stroke(FAINT, Stroke::new(1.).with_dashes(0., [2., 2.])).build(app), app),
                         legend(5, "hover path", square(id!()).fill(AMBER).build(app), app),
                         legend(6, "search hit", square(id!()).fill(CYAN.with_alpha(0.12)).stroke(CYAN, Stroke::new(1.)).build(app), app),
@@ -625,9 +637,9 @@ fn schematic_panel<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State>
 fn view_row<'a>(line: Node, body: &str, state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let id = key(line);
     let on = state.path.contains(&line);
-    let color = state.color(line.0);
+    let color = state.color(line.level);
     let pip = ((58. - state.top() as f32) / (state.top() as f32 + 1.)).min(5.);
-    let pips: Vec<View<'a, State>> = (0..=state.top()).map(|k| square(id!(id, k as u64)).fill(if k <= line.0 { color } else { LINE_HI }).build(app).width(pip).height(4.)).collect();
+    let pips: Vec<View<'a, State>> = (0..=state.top()).map(|k| square(id!(id, k as u64)).fill(if k <= line.level { color } else { LINE_HI }).build(app).width(pip).height(4.)).collect();
     let (background, bar) = match on {
         true => (
             square(id!(id)).fill(|a: Area, _: &()| Gradient::new_linear((a.x as f64, 0.), ((a.x + a.width) as f64, 0.)).with_stops([AMBER.with_alpha(0.12), TRANSPARENT]).into()),
@@ -645,7 +657,7 @@ fn view_row<'a>(line: Node, body: &str, state: &'a State, app: &mut PaneState) -
                     2.,
                     vec![
                         mono(id!(id), line.to_string(), 11, color, app).align(Align::Leading),
-                        mono(id!(id), format!("L{}", line.0), 9, FAINT, app).align(Align::Leading),
+                        mono(id!(id), format!("L{}", line.level), 9, FAINT, app).align(Align::Leading),
                         row_spaced(1., pips).align(Align::Leading),
                         space(),
                     ],
@@ -670,29 +682,30 @@ fn view_row<'a>(line: Node, body: &str, state: &'a State, app: &mut PaneState) -
 
 fn card<'a>(rung: usize, node: Node, columns: usize, state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let id = key(node);
-    let color = state.color(node.0);
+    let color = state.color(node.level);
     let on = state.path.get(rung) == Some(&node);
     let dim = rung > 0 && state.path.get(rung).is_some_and(|&p| p != node);
-    let first = &state.bank.messages[node.start() as usize];
-    let last = &state.bank.messages[node.end() as usize - 1];
+    let (first, last) = ends(&state.bank, node);
     let summary = state.bank.text(node);
     let bytes = summary.map_or(0, str::len);
     let mut head = vec![mono(id!(id), node.to_string(), 13, color, app)];
-    let body = match node.0 {
+    let body = match node.level {
         0 => {
-            head.push(mono(id!(id), moment(&first.date), 10, MUTE, app));
+            head.push(mono(id!(id), when(first), 10, MUTE, app));
             head.push(space());
-            let (role, tint) = match first.kind {
-                Kind::User => ("USER", AMBER),
-                Kind::Assistant => ("ASSISTANT", CYAN),
+            let (role, tint) = match first.map(|m| m.kind) {
+                Some(Kind::User) => ("USER", AMBER),
+                Some(Kind::Assistant) => ("ASSISTANT", CYAN),
+                None => ("PADDING", FAINT),
             };
             head.push(stack(vec![square(id!(id)).stroke(tint, Stroke::new(1.)).build(app), mono(id!(id), role, 9, tint, app)]).width(role.len() as f32 * 6. + 12.).height(15.));
-            first.text.as_str()
+            first.map_or("", |m| m.text.as_str())
         }
         _ => {
             head.push(mono(id!(id), format!("#{}–{}", node.start(), node.end() - 1), 10, MUTE, app));
-            let (a, b) = (moment(&first.date), moment(&last.date));
-            let span = if a[..6] == b[..6] { a[..6].to_string() } else { format!("{} → {}", &a[..6], &b[..6]) };
+            let (a, b) = (when(first), when(last));
+            let (a, b) = (a.get(..6).unwrap_or(&a), b.get(..6).unwrap_or(&b));
+            let span = if a == b { a.to_string() } else { format!("{a} → {b}") };
             head.push(mono(id!(id), span, 10, MUTE, app));
             head.push(space());
             summary.unwrap_or("not summarized yet")
@@ -724,7 +737,7 @@ fn card<'a>(rung: usize, node: Node, columns: usize, state: &'a State, app: &mut
                 vec![
                     stack(vec![
                         square(id!(id)).fill(LINE).build(app),
-                        row(vec![square(id!(id)).fill(color.with_alpha(0.8)).build(app).width(bytes.min(LIMIT) as f32 / LIMIT as f32 * 120.), space()]),
+                        row(vec![square(id!(id)).fill(color.with_alpha(0.8)).build(app).width(bytes.min(state.bank.limits.line) as f32 / state.bank.limits.line as f32 * 120.), space()]),
                     ])
                     .width(120.)
                     .height(3.),
@@ -762,8 +775,8 @@ fn rung_label<'a>(l: u8, hot: bool, app: &mut PaneState) -> View<'a, State> {
 
 fn wedge<'a>(rung: usize, state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let parent = state.path[rung - 1];
-    let from = if rung == 1 { 0.5 } else if parent.1 % 2 == 1 { 0.75 } else { 0.25 };
-    let taken = state.path.get(rung).map(|n| n.1 % 2);
+    let from = if rung == 1 { 0.5 } else if parent.index % 2 == 1 { 0.75 } else { 0.25 };
+    let taken = state.path.get(rung).map(|n| n.index % 2);
     let fork = move |side: u32| {
         move |a: Area| {
             let (x, y, w) = (a.x as f64, a.y as f64, a.width as f64);
@@ -825,9 +838,9 @@ fn ladder<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, Sta
         let width = if nodes.len() == 1 { card_width * 2. + 6. } else { card_width };
         let columns = ((width - 28.) / 6.6) as usize;
         let cards: Vec<View<'a, State>> = nodes.iter().map(|&n| card(*rung, n, columns, state, ctx)).collect();
-        views.push(row_spaced(8., vec![rung_label(nodes[0].0, hot, ctx), row_spaced(6., cards).expand_x()]).height(CARD));
+        views.push(row_spaced(8., vec![rung_label(nodes[0].level, hot, ctx), row_spaced(6., cards).expand_x()]).height(CARD));
     }
-    let hint = match (last.0, state.path.len() == rungs.len()) {
+    let hint = match (last.level, state.path.len() == rungs.len()) {
         (0, _) => "■ VERBATIM MESSAGE REACHED · ROOT LOG".to_string(),
         (l, true) => format!("▼ {l} MORE LEVEL{} TO THE RAW LOG · HOVER TO DESCEND", if l > 1 { "S" } else { "" }),
         (l, false) => format!("▲ HOVER A HALF · {l} LEVEL{} TO THE RAW LOG", if l > 1 { "S" } else { "" }),
@@ -896,9 +909,9 @@ fn crumbs<'a>(state: &'a State, room: f32, app: &mut PaneState) -> View<'a, Stat
         }
         let name = node.to_string();
         let width = crumb_width(node);
-        let label = mono(id!(key(node)), &name, 11, state.color(node.0), app);
+        let label = mono(id!(key(node)), &name, 11, state.color(node.level), app);
         parts.push(match k + 1 == state.path.len() {
-            true => stack(vec![square(id!(key(node))).stroke(state.color(node.0), Stroke::new(1.)).build(app), label]).width(width).height(18.),
+            true => stack(vec![square(id!(key(node))).stroke(state.color(node.level), Stroke::new(1.)).build(app), label]).width(width).height(18.),
             false => label.width(width),
         });
     }
@@ -912,21 +925,20 @@ fn readout<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
 
 fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<View<'a, State>> {
     let node = *state.path.last().expect("the path always has its line");
-    let color = state.color(node.0);
-    let first = &state.bank.messages[node.start() as usize];
-    let last = &state.bank.messages[node.end() as usize - 1];
+    let color = state.color(node.level);
+    let (first, last) = ends(&state.bank, node);
     let summary = state.bank.text(node);
     let bytes = summary.map_or(0, str::len);
-    let leaf = node.0 == 0;
-    let verbatim = leaf && summary == Some(format!("{}: {}", first.kind, first.text).as_str());
-    let parent = Node(node.0 + 1, node.1 / 2);
+    let leaf = node.level == 0;
+    let verbatim = leaf && first.is_some_and(|m| summary == Some(format!("{}: {}", m.kind, m.text).as_str()));
+    let parent = node.parent();
     let line = state.line_of(node.start());
     let kv = |id: u64, label: &str, value: View<'a, State>, app: &mut PaneState| {
         row_spaced(10., vec![row(vec![mono(id!(id), label, 10, MUTE, app), space()]).width(92.).align(Align::Top), value.expand_x()])
     };
     let value = |id: u64, body: String, app: &mut PaneState| text(id!(id), body).font_size(13).fill(TEXT).align(Alignment::Start).wrap().build(app).expand_x();
     let gauge = column(vec![
-        row(vec![space(), mono(id!(), LIMIT.to_string(), 9, RED, app)]).height(12.),
+        row(vec![space(), mono(id!(), state.bank.limits.line.to_string(), 9, RED, app)]).height(12.),
         stack(vec![
             path(id!(), |a| {
                 let mut p = BezPath::new();
@@ -939,14 +951,17 @@ fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<V
             })
             .stroke(LINE, Stroke::new(1.))
             .build(app),
-            row(vec![square(id!()).fill(color).build(app).width(bytes.min(LIMIT) as f32 / LIMIT as f32 * 200.), space()]),
+            row(vec![square(id!()).fill(color).build(app).width(bytes.min(state.bank.limits.line) as f32 / state.bank.limits.line as f32 * 200.), space()]),
             square(id!()).fill(TRANSPARENT).stroke(LINE_HI, Stroke::new(1.)).build(app),
         ])
         .height(10.),
     ])
     .width(200.);
     let zoom = match node.children() {
-        None => format!("> zoom({}, 1)\n← verbatim · {} · {} B\n{}", node.start(), first.kind, first.text.len(), clip(&first.text, 140)),
+        None => match first {
+            Some(m) => format!("> zoom({}, 1)\n← verbatim · {} · {} B\n{}", node.start(), m.kind, m.text.len(), clip(&m.text, 140)),
+            None => format!("> zoom({}, 1)\n← padding", node.start()),
+        },
         Some([a, b]) => format!("> zoom({}, {})\n{}\n{}", node.start(), node.len(), clip(&state.bank.line(a), 140), clip(&state.bank.line(b), 140)),
     };
     let section = |id: u64, title: String, app: &mut PaneState| row_spaced(8., vec![mono(id!(id), title, 10, MUTE, app), column(vec![space(), square(id!(id)).fill(LINE).build(app).height(1.), space()])]).height(14.);
@@ -955,7 +970,7 @@ fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<V
             10.,
             vec![
                 text(id!(), node.to_string()).font_family(DISPLAY).font_weight(FontWeight::EXTRA_BOLD).font_size(54).fill(AMBER).build(app),
-                column(vec![space(), stack(vec![square(id!()).fill(color).build(app), display(id!(), format!("L{}", node.0), 15, BG, app)]).width(34.).height(22.).pad_bottom(6.)]),
+                column(vec![space(), stack(vec![square(id!()).fill(color).build(app), display(id!(), format!("L{}", node.level), 15, BG, app)]).width(34.).height(22.).pad_bottom(6.)]),
                 space(),
             ],
         )
@@ -967,26 +982,26 @@ fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<V
             6.,
             vec![
                 kv(1, "COVERS", value(1, if leaf { format!("1 message · #{}", node.start()) } else { format!("{} messages · #{}–{}", node.len(), node.start(), node.end() - 1) }, app), app),
-                kv(2, "TIME", value(2, if leaf { moment(&first.date) } else { format!("{} → {}", moment(&first.date), moment(&last.date)) }, app), app),
+                kv(2, "TIME", value(2, if leaf { when(first) } else { format!("{} → {}", when(first), when(last)) }, app), app),
                 kv(
                     3,
                     "SIZE",
-                    column_spaced(4., vec![value(3, format!("{bytes} / {LIMIT} B{}", if verbatim { " · fits, no model call" } else { "" }), app), row(vec![gauge, space()])]),
+                    column_spaced(4., vec![value(3, format!("{bytes} / {} B{}", state.bank.limits.line, if verbatim { " · fits, no model call" } else { "" }), app), row(vec![gauge, space()])]),
                     app,
                 ),
-                kv(4, "PARENT", value(4, if parent.end() <= state.total() { format!("{parent} (L{})", parent.0) } else { "— none yet, still accumulating".to_string() }, app), app),
+                kv(4, "PARENT", value(4, if parent.end() <= state.total() { format!("{parent} (L{})", parent.level) } else { "— none yet, still accumulating".to_string() }, app), app),
                 kv(5, "IN VIEW", value(5, if node == line { "yes, as its own line".to_string() } else { format!("folded inside {line}") }, app), app),
             ],
         ),
         2 => column_spaced(
             8.,
             vec![
-                section(6, if leaf { format!("VERBATIM · {}", first.kind.to_string().to_uppercase()) } else { "SUMMARY".to_string() }, app),
+                section(6, if leaf { first.map_or("PADDING".to_string(), |m| format!("VERBATIM · {}", m.kind.to_string().to_uppercase())) } else { "SUMMARY".to_string() }, app),
                 row_spaced(
                     10.,
                     vec![
                         if leaf { square(id!()).fill(color).build(app).width(2.) } else { empty() },
-                        text(id!(), if leaf { first.text.as_str() } else { summary.unwrap_or("not summarized yet") }).font_size(14).fill(TEXT).align(Alignment::Start).wrap().build(app).expand_x(),
+                        text(id!(), if leaf { first.map_or("", |m| m.text.as_str()) } else { summary.unwrap_or("not summarized yet") }).font_size(14).fill(TEXT).align(Alignment::Start).wrap().build(app).expand_x(),
                     ],
                 ),
             ],
@@ -1007,8 +1022,9 @@ fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<V
 }
 
 fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
-    let lines = state.lines.len();
-    let view_bytes: usize = state.lines.iter().map(|&n| state.bank.line(n).len() + 1).sum();
+    let shown = state.bank.visible(&state.lines);
+    let lines = shown.len();
+    let view_bytes: usize = shown.iter().map(|&n| state.bank.line(n).len() + 1).sum();
     let depth = state.path.len() - 1;
     let searching = !state.query.text.trim().is_empty();
     let main = row_spaced(
@@ -1016,7 +1032,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
         vec![
             panel(
                 1,
-                "View",
+                "Context",
                 "視野",
                 match searching {
                     true => format!("{} hits", state.hits.len()),
@@ -1047,7 +1063,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
                         .pad(8.),
                     match searching {
                         true => scroller(id!(state.hits.len() as u64), None, move |i, _, app| state.hits.get(i).map(|(n, body)| view_row(*n, body, state, app)), app),
-                        false => scroller(id!(lines as u64), None, move |i, _, app| state.lines.get(i).map(|&n| view_row(n, state.bank.text(n).unwrap_or("not summarized yet"), state, app)), app),
+                        false => scroller(id!(lines as u64), None, move |i, _, app| shown.get(i).map(|&n| view_row(n, state.bank.text(n).unwrap_or("not summarized yet"), state, app)), app),
                     },
                 ]),
                 app,
@@ -1062,7 +1078,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
                 app,
             )
             .expand_x(),
-            panel(3, "Readout", "解析", format!("depth {depth} / {}", state.path[0].0), readout(state, app).pad_x(14.).pad_top(12.), app).width(340.),
+            panel(3, "Readout", "解析", format!("depth {depth} / {}", state.path[0].level), readout(state, app).pad_x(14.).pad_top(12.), app).width(340.),
         ],
     );
     let hints: Vec<View<'a, State>> = [("hover", "descend"), ("click", "lock / unlock"), ("↑↓", "level"), ("←→", "sibling"), ("esc", "unlock")]
@@ -1140,8 +1156,8 @@ fn start(state: &mut State, app: &mut PaneState) {
 }
 
 fn reload(state: &mut State, app: &mut PaneState) {
-    let Ok(bank) = Bank::open(&state.dir) else { return };
-    if bank.messages.is_empty() {
+    let Ok(bank) = open(&state.dir) else { return };
+    if bank.messages().is_empty() {
         return;
     }
     let focus = *state.path.last().expect("the path always has its line");
@@ -1152,13 +1168,17 @@ fn reload(state: &mut State, app: &mut PaneState) {
     app.redraw();
 }
 
+fn open(dir: &Path) -> io::Result<Bank<Dir>> {
+    Bank::open(Dir(dir.to_path_buf()), Limits::default())
+}
+
 fn main() {
-    let Some(dir) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: membank-gui <bank>");
+    let Some(dir) = std::env::args_os().nth(1).or_else(|| std::env::var_os("MEMBANK")).map(PathBuf::from).or_else(|| std::env::home_dir().map(|home| home.join(".membank/global"))) else {
+        eprintln!("membank-gui: no home directory; pass a bank path or set MEMBANK");
         process::exit(1)
     };
-    let bank = match Bank::open(&dir) {
-        Ok(bank) if !bank.messages.is_empty() => bank,
+    let bank = match open(&dir) {
+        Ok(bank) if !bank.messages().is_empty() => bank,
         Ok(_) => {
             eprintln!("membank-gui: {} holds no messages; import some first", dir.display());
             process::exit(1)
