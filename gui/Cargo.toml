@@ -1,0 +1,9 @@
+[package]
+name = "membank-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+membank = { path = ".." }
+haven-ui = { git = "https://github.com/cyypherus/haven", branch = "main", version = "0.1.0" }
+notify = "8.2.0"
