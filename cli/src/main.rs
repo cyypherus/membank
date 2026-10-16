@@ -85,6 +85,23 @@ fn run(dir: &Path, action: Action) -> io::Result<()> {
         Action::Context { budget } => {
             let bank = open()?;
             let mut out = io::stdout().lock();
+            let m = format!("membank --bank {}", dir.display());
+            writeln!(out, "<membank>
+The <chat> below is the user's entire history with you, every chat in every
+project. What they told you before is here, not in the code or memory files.
+It is compacted into a binary tree: each line is id+n|text, a summary of the n
+messages from id on, oldest first. Its latest word on a thing is the truth.
+Lines are lossy, so zoom until you have the thing whole. Check here first,
+before any other source and before you act, guess or ask, whenever the user
+refers back to something, corrects you, or names a person, ID, branch, ticket
+or file you don't recognize:
+- {m} zoom <id> <n> opens line id+n into the two lines it was made from
+- {m} zoom <id> 1 gives message id whole
+- {m} date <id> gives the date and time of message id
+Only when no line here points to it, {m} search <words>
+lists the best fuzzy matches as lines to zoom. Tool calls are not kept, so say
+in your reply what you learned that will matter later.
+</membank>")?;
             writeln!(out, "<chat>")?;
             let lines: Vec<String> = bank.visible(&bank.shrink(bank.context(), bank.context().last().map_or(0, |n| n.end()), budget)).into_iter().map(|n| bank.line(n)).collect();
             let mut room = budget;

@@ -5,10 +5,15 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::{env, process};
 
 pub fn run(name: &str, message: impl Fn(Value) -> io::Result<Option<Message>>) {
-    let transcripts: Vec<_> = env::args_os().skip(1).collect();
+    let mut transcripts: Vec<_> = env::args_os().skip(1).collect();
     if transcripts.is_empty() {
-        eprintln!("usage: {name} TRANSCRIPT.jsonl... > chat.jsonl");
-        process::exit(2);
+        match serde_json::from_reader::<_, Value>(io::stdin()).ok().and_then(|hook| hook["transcript_path"].as_str().map(Into::into)) {
+            Some(path) => transcripts.push(path),
+            None => {
+                eprintln!("usage: {name} TRANSCRIPT.jsonl... > chat.jsonl, or a hook's JSON with transcript_path on stdin");
+                process::exit(2);
+            }
+        }
     }
     let mut out = io::stdout().lock();
     let converted = transcripts.iter().try_for_each(|path| {
