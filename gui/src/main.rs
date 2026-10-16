@@ -684,7 +684,7 @@ fn card<'a>(rung: usize, node: Node, columns: usize, state: &'a State, app: &mut
             head.push(space());
             let (role, tint) = match first.kind {
                 Kind::User => ("USER", AMBER),
-                Kind::Claude => ("CLAUDE", CYAN),
+                Kind::Assistant => ("ASSISTANT", CYAN),
             };
             head.push(stack(vec![square(id!(id)).stroke(tint, Stroke::new(1.)).build(app), mono(id!(id), role, 9, tint, app)]).width(role.len() as f32 * 6. + 12.).height(15.));
             first.text.as_str()
