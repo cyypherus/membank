@@ -97,7 +97,8 @@ messages from id on, oldest first. Its latest word on a thing is the truth.
 Lines are lossy, so zoom until you have the thing whole. Check here first,
 before any other source and before you act, guess or ask, whenever the user
 refers back to something, corrects you, or names a person, ID, branch, ticket
-or file you don't recognize:
+or file you don't recognize. Never ask the user a question until you have
+searched here for its answer; ask only what this history cannot answer:
 - {m} zoom <id> <n> opens line id+n into the two lines it was made from
 - {m} zoom <id> 1 gives message id whole
 - {m} date <id> gives the date and time of message id
