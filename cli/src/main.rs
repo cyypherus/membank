@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use clap::{Parser, Subcommand};
 use log::{debug, info};
 use membank::{Bank, Dir, Limits, Message, Node, SYSTEM};
@@ -43,6 +44,8 @@ enum Action {
         words: Vec<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, num_args = 2, value_names = ["ID", "N"])]
+        under: Option<Vec<u32>>,
     },
 }
 
@@ -104,7 +107,8 @@ searched here for its answer; ask only what this history cannot answer:
 - {m} zoom <id> 1 gives message id whole
 - {m} date <id> gives the date and time of message id
 Only when no line here points to it, {m} search <words>
-lists the best fuzzy matches as lines to zoom. Tool calls are not kept, so say
+gives the highest line that matches, and {m} search --under <id> <n> <words>
+lists the matching lines inside line id+n. Tool calls are not kept, so say
 in your reply what you learned that will matter later.
 </membank>")?;
             writeln!(out, "<chat>")?;
@@ -118,11 +122,7 @@ in your reply what you learned that will matter later.
         }
         Action::Zoom { id, n } => {
             let bank = open()?;
-            let l = n.trailing_zeros();
-            if !n.is_power_of_two() || id % n != 0 || id + n > bank.messages().len() as u32 {
-                return Err(io::Error::new(ErrorKind::InvalidInput, format!("{id}+{n} is not a line of this bank")));
-            }
-            match (Node { level: l as u8, index: id / n }).children() {
+            match line(&bank, id, n)?.children() {
                 None => {
                     if let Some(message) = &bank.messages()[id as usize] {
                         println!("{}: {}", message.kind, message.text);
@@ -146,15 +146,30 @@ in your reply what you learned that will matter later.
             let message = bank.messages().get(id as usize).and_then(Option::as_ref).ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("no message {id}")))?;
             println!("{}", message.date);
         }
-        Action::Search { words, limit } => {
+        Action::Search { words, limit, under } => {
             let bank = open()?;
             let mut out = io::stdout().lock();
-            for (node, text) in bank.search(&words.join(" ")).into_iter().take(limit) {
+            let hits = bank.search(&words.join(" "));
+            let shown: Vec<_> = match under.as_deref() {
+                Some(&[id, n]) => {
+                    let root = line(&bank, id, n)?;
+                    hits.into_iter().filter(|(node, _)| node.level < root.level && root.start() <= node.start() && node.end() <= root.end()).take(limit).collect()
+                }
+                _ => hits.into_iter().enumerate().max_by_key(|(i, (node, _))| (node.level, Reverse(*i))).map(|(_, hit)| hit).into_iter().collect(),
+            };
+            for (node, text) in shown {
                 writeln!(out, "{node}|{}", text[..text.floor_char_boundary(240)].replace('\n', " "))?;
             }
         }
     }
     Ok(())
+}
+
+fn line(bank: &Bank<Dir>, id: u32, n: u32) -> io::Result<Node> {
+    if !n.is_power_of_two() || id % n != 0 || id + n > bank.messages().len() as u32 {
+        return Err(io::Error::new(ErrorKind::InvalidInput, format!("{id}+{n} is not a line of this bank")));
+    }
+    Ok(Node { level: n.trailing_zeros() as u8, index: id / n })
 }
 
 fn default_bank() -> Option<PathBuf> {

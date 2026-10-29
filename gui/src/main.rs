@@ -2,7 +2,9 @@ use haven::winit::WinitApp;
 use haven::*;
 use membank::{Bank, Dir, Kind, Limits, Message, Node};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use peniko::{Blob, Extend, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality};
 use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -12,9 +14,11 @@ struct State {
     bank: Bank<Dir>,
     lines: Vec<Node>,
     built: usize,
+    bytes: usize,
     path: Vec<Node>,
     locked: bool,
     tip: Option<Node>,
+    row: Option<u8>,
     span: Range<f32>,
     ladder_scroll: f32,
     query: TextState,
@@ -77,7 +81,10 @@ impl State {
     }
 
     fn class(&self, node: Node) -> Class {
-        let line = self.line_of(node.start());
+        self.class_in(node, self.line_of(node.start()))
+    }
+
+    fn class_in(&self, node: Node, line: Node) -> Class {
         match () {
             _ if node.level > line.level => Class::Coarser,
             _ if self.bank.text(node).is_none() => Class::Unbuilt,
@@ -174,11 +181,12 @@ impl State {
     }
 }
 
-fn load(bank: Bank<Dir>) -> (Bank<Dir>, Vec<Node>, usize) {
+fn load(bank: Bank<Dir>) -> (Bank<Dir>, Vec<Node>, usize, usize) {
     let covered = bank.context().last().map_or(0, |n| n.end());
-    let lines = bank.context().iter().copied().chain((covered..bank.messages().len() as u32).map(Node::message)).collect();
+    let lines: Vec<Node> = bank.context().iter().copied().chain((covered..bank.messages().len() as u32).map(Node::message)).collect();
     let built = bank.nodes().count();
-    (bank, lines, built)
+    let bytes = bank.visible(&lines).iter().map(|&n| bank.line(n).len() + 1).sum();
+    (bank, lines, built, bytes)
 }
 
 fn ends(bank: &Bank<Dir>, node: Node) -> (Option<&Message>, Option<&Message>) {
@@ -264,6 +272,19 @@ fn chamfer(a: Area, cut: f64) -> BezPath {
     p
 }
 
+static GRID: OnceLock<Brush> = OnceLock::new();
+static SCANLINES: OnceLock<Brush> = OnceLock::new();
+
+fn tile(brush: &OnceLock<Brush>, width: u32, height: u32, pixel: impl Fn(u32, u32) -> Option<Color>) -> Brush {
+    brush
+        .get_or_init(|| {
+            let data: Vec<u8> = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).flat_map(|(x, y)| pixel(x, y).map_or([0; 4], |c| c.to_rgba8().to_u8_array())).collect();
+            let image = ImageData { data: Blob::new(Arc::new(data)), format: ImageFormat::Rgba8, alpha_type: ImageAlphaType::Alpha, width, height };
+            Brush::Image(ImageBrush::new(image).with_extend(Extend::Repeat).with_quality(ImageQuality::Low))
+        })
+        .clone()
+}
+
 fn placed<'a>(view: View<'a, State>, area: Area, x: f32, y: f32, w: f32, h: f32) -> View<'a, State> {
     view.width(w).height(h).offset(x + w / 2. - area.width / 2., y + h / 2. - area.height / 2.)
 }
@@ -328,7 +349,6 @@ fn chip<'a>(id: u64, label: &str, value: String, color: Color, border: Color, do
 fn header<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let total = state.total();
     let shown = state.bank.visible(&state.lines);
-    let bytes: usize = shown.iter().map(|&n| state.bank.line(n).len() + 1).sum();
     let complete: usize = (0..=state.top()).map(|l| (total >> l) as usize).sum();
     let pending = complete.saturating_sub(state.built);
     let (link, link_color) = if state.locked { ("LOCKED", RED) } else { ("TRACKING", CYAN) };
@@ -390,7 +410,7 @@ fn header<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
             hazard.expand_x().height(48.),
             chip(id!(), "LOG", format!("{total} MSG"), TEXT, LINE_HI, None, app),
             chip(id!(), "TREE", format!("L0–L{} · {} NODES", state.top(), state.built), TEXT, LINE_HI, None, app),
-            chip(id!(), "CONTEXT", format!("{} NODES · {:.1} KB", shown.len(), bytes as f32 / 1024.), TEXT, LINE_HI, None, app),
+            chip(id!(), "CONTEXT", format!("{} NODES · {:.1} KB", shown.len(), state.bytes as f32 / 1024.), TEXT, LINE_HI, None, app),
             match pending {
                 0 => chip(id!(), "COMPACTOR", "SYNCED".to_string(), CYAN, LINE_HI, Some(CYAN), app),
                 n => chip(id!(), "COMPACTOR", format!("{n} PENDING"), AMBER, LINE_HI, Some(CYAN), app),
@@ -430,12 +450,22 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
             _ => runs.push((start, end, class)),
         };
         if count <= EXACT {
-            for i in visible(l, count) {
+            let nodes = visible(l, count);
+            let mut k = state.lines.partition_point(|n| n.end() <= nodes.start << l);
+            for i in nodes.clone() {
                 let node = Node { level: l, index: i };
-                push(node.start(), node.end(), state.class(node));
-                if width >= 3. {
-                    seams.push((x(node.end()), y(l)));
+                while k + 1 < state.lines.len() && state.lines[k].end() <= node.start() {
+                    k += 1;
                 }
+                push(node.start(), node.end(), state.class_in(node, state.lines[k.min(state.lines.len() - 1)]));
+            }
+            let (left, right) = (x((nodes.start + 1) << l) - 0.5, x(nodes.end << l) + 0.5);
+            if width >= 3. && left < right {
+                let edge = 1. / width;
+                let seam = square(id!(l as u64)).fill(move |a: Area, _: &()| {
+                    Gradient::new_linear((a.x as f64, 0.), ((a.x + width) as f64, 0.)).with_extend(Extend::Repeat).with_stops([(0., BG), (edge, BG), (edge, TRANSPARENT), (1., TRANSPARENT)]).into()
+                });
+                seams.push(placed(seam.build(ctx), area, left, y(l), right - left, ROW));
             }
         } else {
             for &line in &state.lines {
@@ -467,18 +497,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
             views.push(placed(pend, area, left, y(l) + 1., right - left, ROW - 2.));
         }
     }
-    views.push(
-        path(id!(), move |a| {
-            let mut p = BezPath::new();
-            for (sx, sy) in &seams {
-                p.move_to((a.x as f64 + *sx as f64, a.y as f64 + *sy as f64));
-                p.line_to((a.x as f64 + *sx as f64, a.y as f64 + (*sy + ROW) as f64));
-            }
-            p
-        })
-        .stroke(BG, Stroke::new(1.))
-        .build(ctx),
-    );
+    views.extend(seams);
     let marks: Vec<(f32, f32, f32)> = state
         .hits
         .iter()
@@ -525,6 +544,22 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
         views.push(placed(ring, area, left, y(tip.level) + 1., (right - left).max(2.), ROW - 2.));
     }
     for l in 0..=top {
+        let row = square(id!(l as u64))
+            .fill(TRANSPARENT)
+            .view()
+            .gesture(gesture::hover(id!(l as u64)).run(move |state: &mut State, app, inside| {
+                match inside {
+                    true => state.row = Some(l),
+                    false if state.row == Some(l) => state.row = None,
+                    false => return,
+                }
+                app.redraw();
+            }))
+            .build(ctx);
+        views.push(placed(row, area, 0., y(l), area.width, ROW));
+        if state.row != Some(l) {
+            continue;
+        }
         let count = state.total() >> l;
         let group = (5. / ((1u32 << l) as f32 * scale)).ceil().max(1.) as u32;
         let cells = ((lo as u32 >> l) / group)..((hi.ceil() as u32 >> l).min(count) + group - 1) / group;
@@ -535,7 +570,7 @@ fn schematic<'a>(state: &'a State, area: Area, ctx: &mut PaneState) -> View<'a, 
             let target = square(id!(key(node), k as u64))
                 .fill(TRANSPARENT)
                 .view()
-                .gesture(gesture::hover(id!(key(node), k as u64)).run(move |state: &mut State, app, inside| {
+                .gesture(gesture::hover(id!(key(node), k as u64)).observe().run(move |state: &mut State, app, inside| {
                     match inside {
                         true => state.tip = Some(node),
                         false if state.tip == Some(node) => state.tip = None,
@@ -1024,7 +1059,6 @@ fn readout_cell<'a>(i: usize, state: &'a State, app: &mut PaneState) -> Option<V
 fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let shown = state.bank.visible(&state.lines);
     let lines = shown.len();
-    let view_bytes: usize = shown.iter().map(|&n| state.bank.line(n).len() + 1).sum();
     let depth = state.path.len() - 1;
     let searching = !state.query.text.trim().is_empty();
     let main = row_spaced(
@@ -1036,7 +1070,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
                 "視野",
                 match searching {
                     true => format!("{} hits", state.hits.len()),
-                    false => format!("{lines} nodes · {view_bytes} B"),
+                    false => format!("{lines} nodes · {} B", state.bytes),
                 },
                 column(vec![
                     text_field(id!(), binding!(state.query))
@@ -1109,41 +1143,12 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
                 }
             }))
             .build(app),
-        path(id!(), |a| {
-            let mut p = BezPath::new();
-            let (x0, y0, x1, y1) = (a.x as f64, a.y as f64, (a.x + a.width) as f64, (a.y + a.height) as f64);
-            let mut x = x0;
-            while x < x1 {
-                p.move_to((x, y0));
-                p.line_to((x, y1));
-                x += 40.;
-            }
-            let mut y = y0;
-            while y < y1 {
-                p.move_to((x0, y));
-                p.line_to((x1, y));
-                y += 40.;
-            }
-            p
-        })
-        .stroke(LINE.with_alpha(0.35), Stroke::new(1.))
-        .build(app),
+        square(id!()).fill(tile(&GRID, 40, 40, |x, y| (x == 0 || y == 0).then_some(LINE.with_alpha(0.35)))).build(app),
         square(id!())
             .fill(|a: Area, _: &()| Gradient::new_radial(((a.x + a.width / 2.) as f64, (a.y - a.height / 10.) as f64), 720.).with_stops([AMBER.with_alpha(0.07), TRANSPARENT]).into())
             .build(app),
         column_spaced(10., vec![header(state, app), schematic_panel(state, app), main.expand(), row_spaced(16., footer).height(16.)]).pad_x(16.).pad_top(34.).pad_bottom(12.),
-        path(id!(), |a| {
-            let mut p = BezPath::new();
-            let mut y = a.y as f64;
-            while y < (a.y + a.height) as f64 {
-                p.move_to((a.x as f64, y + 2.5));
-                p.line_to(((a.x + a.width) as f64, y + 2.5));
-                y += 3.;
-            }
-            p
-        })
-        .stroke(Color::WHITE.with_alpha(0.022), Stroke::new(1.))
-        .build(app),
+        square(id!()).fill(tile(&SCANLINES, 1, 3, |_, y| (y == 2).then_some(Color::WHITE.with_alpha(0.022)))).build(app),
     ])
 }
 
@@ -1161,7 +1166,7 @@ fn reload(state: &mut State, app: &mut PaneState) {
         return;
     }
     let focus = *state.path.last().expect("the path always has its line");
-    (state.bank, state.lines, state.built) = load(bank);
+    (state.bank, state.lines, state.built, state.bytes) = load(bank);
     state.path = state.route(focus);
     let query = state.query.text.clone();
     state.find(&query);
@@ -1188,8 +1193,9 @@ fn main() {
             process::exit(1)
         }
     };
-    let (bank, lines, built) = load(bank);
+    let (bank, lines, built, bytes) = load(bank);
     let path = vec![lines[0]];
-    let state = State { dir, bank, lines, built, path, locked: false, tip: None, span: 0.0..f32::INFINITY, ladder_scroll: 0., query: TextState::new(""), hits: Vec::new(), watcher: None };
+    let state = State { dir, bank, lines, built, bytes, path, locked: false, tip: None, row: None, span: 0.0..f32::INFINITY, ladder_scroll: 0., query: TextState::new(""), hits: Vec::new(), watcher: None };
     WinitApp::new(state).pane(PaneBuilder::new("main", view).on_start(start).on_wake(reload).title("membank").inner_size(1500, 940)).run();
 }
+

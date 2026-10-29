@@ -1243,7 +1243,7 @@ dependencies = [
 [[package]]
 name = "haven-ui"
 version = "0.1.0"
-source = "git+https://github.com/cyypherus/haven?branch=main#75931f1b486db982daac70608eb299e5131571a3"
+source = "git+https://github.com/cyypherus/haven?branch=scroller-fix#82354d4fef2ff94b250727ffd6cc63061a4ea320"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -1937,6 +1937,7 @@ dependencies = [
  "haven-ui",
  "membank",
  "notify",
+ "peniko",
 ]
 
 [[package]]
