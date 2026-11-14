@@ -480,6 +480,10 @@ impl<S: Store> Bank<S> {
         self.forget(i)
     }
 
+    pub fn remove_summary(&mut self, i: u32) -> io::Result<()> {
+        self.forget(i)
+    }
+
     fn forget(&mut self, position: u32) -> io::Result<()> {
         let mut node = Node::message(position);
         while self.text(node).is_some() {
@@ -768,5 +772,24 @@ mod tests {
         let mut rebuilt = Vec::new();
         reopened.compact(4, ask, |node, _| rebuilt.push(node)).unwrap();
         assert_eq!(rebuilt, (0..7).map(|l| Node { level: l, index: 5 >> l }).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn remove_summary_keeps_the_message_and_clears_its_ancestors() {
+        let mut saved = Saved::default();
+        let mut bank = Bank::open(&mut saved, Limits::default()).unwrap();
+        for i in 0..64 {
+            bank.add(vec![message(Kind::User, &format!("message {i} {}", "x".repeat(600)), &i.to_string())]).unwrap();
+        }
+        bank.compact(4, |_| Ok("junk".to_string()), |_, _| {}).unwrap();
+        bank.remove_summary(5).unwrap();
+        let mut reopened = Bank::open(&mut saved, Limits::default()).unwrap();
+        assert!(reopened.messages()[5].as_ref().unwrap().text.starts_with("message 5 "));
+        assert!((0..7).all(|l| reopened.text(Node { level: l, index: 5 >> l }).is_none()));
+        assert_eq!(reopened.text(Node::message(4)), Some("junk"));
+        let mut rebuilt = Vec::new();
+        reopened.compact(4, |task: &str| Ok(format!("summary {}", &task[task.len() - 40..])), |node, _| rebuilt.push(node)).unwrap();
+        assert_eq!(rebuilt, (0..7).map(|l| Node { level: l, index: 5 >> l }).collect::<Vec<_>>());
+        assert!(reopened.text(Node::message(5)).unwrap().starts_with("summary "));
     }
 }

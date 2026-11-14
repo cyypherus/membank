@@ -38,6 +38,10 @@ enum Action {
         #[arg(required = true)]
         ids: Vec<u32>,
     },
+    RemoveSummary {
+        #[arg(required = true)]
+        ids: Vec<u32>,
+    },
     Date { id: u32 },
     Search {
         #[arg(required = true)]
@@ -139,6 +143,16 @@ in your reply what you learned that will matter later.
             }
             for id in ids {
                 bank.prune(id)?;
+            }
+        }
+        Action::RemoveSummary { ids } => {
+            let _lock = lock(dir)?;
+            let mut bank = open()?;
+            if let Some(id) = ids.iter().find(|&&id| id as usize >= bank.messages().len()) {
+                return Err(io::Error::new(ErrorKind::InvalidInput, format!("no message {id}")));
+            }
+            for id in ids {
+                bank.remove_summary(id)?;
             }
         }
         Action::Date { id } => {
